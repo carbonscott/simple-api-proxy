@@ -1,0 +1,7 @@
+keys.json
+*.dat
+stanford-proxy
+bench/results/*
+!bench/results/ANALYSIS.md
+bench/plots/
+bench/.venv/

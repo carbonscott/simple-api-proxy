@@ -24,7 +24,7 @@ fi
 # Verify proxy is reachable
 if ! curl -sf "$PROXY_HOST/health" >/dev/null 2>&1; then
     echo "ERROR: Proxy not responding at $PROXY_HOST/health"
-    echo "Start it with: $PROJECT_DIR/stanford-proxy serve -port 4001"
+    echo "Start it with: $PROJECT_DIR/simple-api-proxy serve -port 4001"
     exit 1
 fi
 

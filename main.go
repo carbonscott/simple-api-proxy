@@ -111,7 +111,7 @@ func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 4000, "listen port")
 	keysPath := fs.String("keys", "keys.json", "path to keys file")
-	apiKeyPath := fs.String("apikey", "~/.config/stanford-ai/key.dat", "path to API key file")
+	apiKeyPath := fs.String("apikey", "~/.config/simple-api-proxy/key.dat", "path to API key file")
 	upstream := fs.String("upstream", "https://aiapi-prod.stanford.edu", "upstream base URL")
 	fs.Parse(args)
 
@@ -191,7 +191,7 @@ func cmdAdd(args []string) {
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: stanford-proxy add <username> [-keys path]")
+		fmt.Fprintln(os.Stderr, "usage: simple-api-proxy add <username> [-keys path]")
 		os.Exit(1)
 	}
 	username := fs.Arg(0)
@@ -224,7 +224,7 @@ func cmdRevoke(args []string) {
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: stanford-proxy revoke <username> [-keys path]")
+		fmt.Fprintln(os.Stderr, "usage: simple-api-proxy revoke <username> [-keys path]")
 		os.Exit(1)
 	}
 	username := fs.Arg(0)
@@ -297,7 +297,7 @@ func authMiddleware(lookup map[string]string, next http.Handler) http.Handler {
 // --- Main ---
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: stanford-proxy <command> [flags]
+	fmt.Fprintln(os.Stderr, `usage: simple-api-proxy <command> [flags]
 
 commands:
   serve    start the proxy server

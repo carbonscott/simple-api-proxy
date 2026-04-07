@@ -1,6 +1,6 @@
 keys.json
 *.dat
-stanford-proxy
+simple-api-proxy
 bench/results/*
 !bench/results/ANALYSIS.md
 bench/plots/

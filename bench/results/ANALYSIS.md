@@ -1,4 +1,4 @@
-# Benchmark Analysis: stanford-proxy
+# Benchmark Analysis: simple-api-proxy
 
 **Date:** 2026-04-06
 **Author:** Generated from automated benchmark suite
@@ -7,7 +7,7 @@
 
 ### System Under Test
 
-The proxy is a Go reverse proxy (`stanford-proxy`, 327 lines, stdlib only) that:
+The proxy is a Go reverse proxy (`simple-api-proxy`, 327 lines, stdlib only) that:
 
 - Accepts requests authenticated with per-user proxy keys (`pk-` prefixed bearer tokens)
 - Validates the key against an in-memory lookup table loaded from `keys.json`
@@ -15,7 +15,7 @@ The proxy is a Go reverse proxy (`stanford-proxy`, 327 lines, stdlib only) that:
 - Forwards requests to `https://aiapi-prod.stanford.edu` via `net/http/httputil.ReverseProxy`
 - Streams SSE responses with `FlushInterval: -1` (immediate flush)
 
-Source: `main.go` (module `stanford-proxy`, go 1.22.2)
+Source: `main.go` (module `simple-api-proxy`, go 1.22.2)
 
 ### Machine
 
@@ -223,10 +223,10 @@ Based on observed data, this proxy instance (on a 2-core VM) can handle:
 ```bash
 # Build the proxy
 cd ~/projects/proxy-server-for-opencode
-go build -o stanford-proxy .
+go build -o simple-api-proxy .
 
 # Start the proxy
-./stanford-proxy serve -port 4001 &
+./simple-api-proxy serve -port 4001 &
 
 # Run the full benchmark suite (installs hey if needed, generates plots)
 cd bench && bash bench.sh

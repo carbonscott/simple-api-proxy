@@ -5,7 +5,7 @@ metadata:
   labels:
     app: simple-api-proxy
 spec:
-  replicas: 1
+  replicas: 1  # SQLite requires single writer — do not scale beyond 1
   selector:
     matchLabels:
       app: simple-api-proxy
@@ -23,10 +23,16 @@ spec:
             - serve
             - "-port"
             - "4000"
-            - "-keys"
-            - /etc/config/keys.json
+            - "-db"
+            - /data/keys.db
             - "-apikey"
             - /etc/secrets/key.dat
+          env:
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: simple-api-proxy-admin
+                  key: token
           livenessProbe:
             httpGet:
               path: /health
@@ -50,13 +56,12 @@ spec:
             - name: apikey
               mountPath: /etc/secrets
               readOnly: true
-            - name: keys
-              mountPath: /etc/config
-              readOnly: true
+            - name: data
+              mountPath: /data
       volumes:
         - name: apikey
           secret:
             secretName: simple-api-proxy-apikey
-        - name: keys
-          configMap:
-            name: simple-api-proxy-keys
+        - name: data
+          persistentVolumeClaim:
+            claimName: simple-api-proxy-data

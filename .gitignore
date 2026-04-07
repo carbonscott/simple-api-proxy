@@ -5,4 +5,6 @@ bench/results/*
 !bench/results/ANALYSIS.md
 bench/plots/
 bench/.venv/
+*.db
 k8s/secret.yaml
+k8s/admin-secret.yaml

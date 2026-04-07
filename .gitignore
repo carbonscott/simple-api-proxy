@@ -5,3 +5,4 @@ bench/results/*
 !bench/results/ANALYSIS.md
 bench/plots/
 bench/.venv/
+k8s/secret.yaml

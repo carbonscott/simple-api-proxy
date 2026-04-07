@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -18,50 +19,131 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // --- Data types ---
 
-type KeyEntry struct {
-	Key     string `json:"key"`
-	Created string `json:"created"`
+type KeyStore interface {
+	Add(username string) (string, error)
+	Revoke(username string) error
+	List() ([]KeyInfo, error)
+	Lookup(token string) (string, bool)
 }
 
-type KeyStore struct {
-	Users map[string]KeyEntry `json:"users"`
+type KeyInfo struct {
+	Username  string `json:"username"`
+	KeyPrefix string `json:"key_prefix"`
+	CreatedAt string `json:"created_at"`
 }
 
 type contextKey string
 
 const ctxUser contextKey = "user"
 
-// --- Key store functions ---
+// --- SQLite store ---
 
-func loadKeys(path string) (*KeyStore, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &KeyStore{Users: make(map[string]KeyEntry)}, nil
-		}
-		return nil, err
-	}
-	var ks KeyStore
-	if err := json.Unmarshal(data, &ks); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	if ks.Users == nil {
-		ks.Users = make(map[string]KeyEntry)
-	}
-	return &ks, nil
+type SQLiteStore struct {
+	db *sql.DB
 }
 
-func saveKeys(path string, ks *KeyStore) error {
-	data, err := json.MarshalIndent(ks, "", "  ")
+func NewSQLiteStore(path string) (*SQLiteStore, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS keys (
+		username   TEXT PRIMARY KEY,
+		key        TEXT NOT NULL UNIQUE,
+		created_at TEXT NOT NULL
+	)`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &SQLiteStore{db: db}, nil
+}
+
+func (s *SQLiteStore) Close() error {
+	return s.db.Close()
+}
+
+func (s *SQLiteStore) Add(username string) (string, error) {
+	key := generateKey()
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.Exec(
+		"INSERT INTO keys (username, key, created_at) VALUES (?, ?, ?)",
+		username, key, createdAt,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "PRIMARY KEY") {
+			return "", fmt.Errorf("user %q already exists", username)
+		}
+		return "", err
+	}
+	return key, nil
+}
+
+func (s *SQLiteStore) Revoke(username string) error {
+	res, err := s.db.Exec("DELETE FROM keys WHERE username = ?", username)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0600)
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user %q not found", username)
+	}
+	return nil
 }
+
+func (s *SQLiteStore) List() ([]KeyInfo, error) {
+	rows, err := s.db.Query("SELECT username, key, created_at FROM keys ORDER BY created_at")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []KeyInfo
+	for rows.Next() {
+		var username, key, createdAt string
+		if err := rows.Scan(&username, &key, &createdAt); err != nil {
+			return nil, err
+		}
+		prefix := key
+		if len(prefix) > 11 {
+			prefix = prefix[:11] + "..."
+		}
+		keys = append(keys, KeyInfo{
+			Username:  username,
+			KeyPrefix: prefix,
+			CreatedAt: createdAt,
+		})
+	}
+	return keys, rows.Err()
+}
+
+func (s *SQLiteStore) Lookup(token string) (string, bool) {
+	var username string
+	err := s.db.QueryRow("SELECT username FROM keys WHERE key = ?", token).Scan(&username)
+	if err != nil {
+		return "", false
+	}
+	return username, true
+}
+
+// insertRaw inserts a key entry directly (used by migrate command).
+func (s *SQLiteStore) insertRaw(username, key, createdAt string) error {
+	_, err := s.db.Exec(
+		"INSERT INTO keys (username, key, created_at) VALUES (?, ?, ?)",
+		username, key, createdAt,
+	)
+	return err
+}
+
+// --- Key generation ---
 
 func generateKey() string {
 	b := make([]byte, 16)
@@ -69,14 +151,6 @@ func generateKey() string {
 		log.Fatalf("crypto/rand failed: %v", err)
 	}
 	return "pk-" + hex.EncodeToString(b)
-}
-
-func buildLookup(ks *KeyStore) map[string]string {
-	m := make(map[string]string, len(ks.Users))
-	for user, entry := range ks.Users {
-		m[entry.Key] = user
-	}
-	return m
 }
 
 // --- Path helpers ---
@@ -105,27 +179,71 @@ func loadAPIKey(path string) string {
 	return key
 }
 
+func loadAdminToken(filePath string) string {
+	if filePath != "" {
+		filePath = expandHome(filePath)
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Fatalf("cannot read admin token file %s: %v", filePath, err)
+		}
+		token := strings.TrimSpace(string(data))
+		if token != "" {
+			return token
+		}
+	}
+	return os.Getenv("ADMIN_TOKEN")
+}
+
+// --- JSON migration helper ---
+
+type jsonKeyEntry struct {
+	Key     string `json:"key"`
+	Created string `json:"created"`
+}
+
+type jsonKeyStore struct {
+	Users map[string]jsonKeyEntry `json:"users"`
+}
+
+func loadKeysJSON(path string) (*jsonKeyStore, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var ks jsonKeyStore
+	if err := json.Unmarshal(data, &ks); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if ks.Users == nil {
+		ks.Users = make(map[string]jsonKeyEntry)
+	}
+	return &ks, nil
+}
+
 // --- CLI subcommands ---
 
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 4000, "listen port")
-	keysPath := fs.String("keys", "keys.json", "path to keys file")
+	dbPath := fs.String("db", "keys.db", "path to SQLite database")
 	apiKeyPath := fs.String("apikey", "~/.config/simple-api-proxy/key.dat", "path to API key file")
 	upstream := fs.String("upstream", "https://aiapi-prod.stanford.edu", "upstream base URL")
+	adminTokenFile := fs.String("admin-token-file", "", "path to admin token file (or set ADMIN_TOKEN env)")
 	fs.Parse(args)
 
 	apiKey := loadAPIKey(*apiKeyPath)
 
-	ks, err := loadKeys(*keysPath)
+	store, err := NewSQLiteStore(*dbPath)
 	if err != nil {
-		log.Fatalf("cannot load keys: %v", err)
+		log.Fatalf("cannot open database: %v", err)
 	}
-	lookup := buildLookup(ks)
-	if len(lookup) == 0 {
-		log.Printf("WARNING: no proxy keys in %s — all requests will be rejected", *keysPath)
+	defer store.Close()
+
+	keys, _ := store.List()
+	if len(keys) == 0 {
+		log.Printf("WARNING: no proxy keys in %s — all requests will be rejected", *dbPath)
 	} else {
-		log.Printf("loaded %d proxy key(s) from %s", len(lookup), *keysPath)
+		log.Printf("loaded %d proxy key(s) from %s", len(keys), *dbPath)
 	}
 
 	upstreamURL, err := url.Parse(*upstream)
@@ -160,7 +278,19 @@ func cmdServe(args []string) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok"}`)
 	})
-	mux.Handle("/", authMiddleware(lookup, proxy))
+
+	adminToken := loadAdminToken(*adminTokenFile)
+	if adminToken != "" {
+		adminAuth := adminAuthMiddleware(adminToken)
+		mux.Handle("GET /admin/keys", adminAuth(handleAdminListKeys(store)))
+		mux.Handle("POST /admin/keys", adminAuth(handleAdminAddKey(store)))
+		mux.Handle("DELETE /admin/keys/{username}", adminAuth(handleAdminRevokeKey(store)))
+		log.Println("admin API enabled on /admin/keys")
+	} else {
+		log.Println("WARNING: no admin token configured — admin API disabled")
+	}
+
+	mux.Handle("/", authMiddleware(store, proxy))
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *port),
@@ -187,32 +317,24 @@ func cmdServe(args []string) {
 
 func cmdAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
-	keysPath := fs.String("keys", "keys.json", "path to keys file")
+	dbPath := fs.String("db", "keys.db", "path to SQLite database")
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: simple-api-proxy add <username> [-keys path]")
+		fmt.Fprintln(os.Stderr, "usage: simple-api-proxy add <username> [-db path]")
 		os.Exit(1)
 	}
 	username := fs.Arg(0)
 
-	ks, err := loadKeys(*keysPath)
+	store, err := NewSQLiteStore(*dbPath)
 	if err != nil {
-		log.Fatalf("cannot load keys: %v", err)
+		log.Fatalf("cannot open database: %v", err)
 	}
+	defer store.Close()
 
-	if _, exists := ks.Users[username]; exists {
-		log.Fatalf("user %q already exists — revoke first to regenerate", username)
-	}
-
-	key := generateKey()
-	ks.Users[username] = KeyEntry{
-		Key:     key,
-		Created: time.Now().UTC().Format(time.RFC3339),
-	}
-
-	if err := saveKeys(*keysPath, ks); err != nil {
-		log.Fatalf("cannot save keys: %v", err)
+	key, err := store.Add(username)
+	if err != nil {
+		log.Fatalf("cannot add key: %v", err)
 	}
 
 	fmt.Printf("Created key for %s: %s\n", username, key)
@@ -220,28 +342,23 @@ func cmdAdd(args []string) {
 
 func cmdRevoke(args []string) {
 	fs := flag.NewFlagSet("revoke", flag.ExitOnError)
-	keysPath := fs.String("keys", "keys.json", "path to keys file")
+	dbPath := fs.String("db", "keys.db", "path to SQLite database")
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: simple-api-proxy revoke <username> [-keys path]")
+		fmt.Fprintln(os.Stderr, "usage: simple-api-proxy revoke <username> [-db path]")
 		os.Exit(1)
 	}
 	username := fs.Arg(0)
 
-	ks, err := loadKeys(*keysPath)
+	store, err := NewSQLiteStore(*dbPath)
 	if err != nil {
-		log.Fatalf("cannot load keys: %v", err)
+		log.Fatalf("cannot open database: %v", err)
 	}
+	defer store.Close()
 
-	if _, exists := ks.Users[username]; !exists {
-		log.Fatalf("user %q not found", username)
-	}
-
-	delete(ks.Users, username)
-
-	if err := saveKeys(*keysPath, ks); err != nil {
-		log.Fatalf("cannot save keys: %v", err)
+	if err := store.Revoke(username); err != nil {
+		log.Fatalf("cannot revoke key: %v", err)
 	}
 
 	fmt.Printf("Revoked key for %s\n", username)
@@ -249,34 +366,150 @@ func cmdRevoke(args []string) {
 
 func cmdList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	keysPath := fs.String("keys", "keys.json", "path to keys file")
+	dbPath := fs.String("db", "keys.db", "path to SQLite database")
 	fs.Parse(args)
 
-	ks, err := loadKeys(*keysPath)
+	store, err := NewSQLiteStore(*dbPath)
 	if err != nil {
-		log.Fatalf("cannot load keys: %v", err)
+		log.Fatalf("cannot open database: %v", err)
+	}
+	defer store.Close()
+
+	keys, err := store.List()
+	if err != nil {
+		log.Fatalf("cannot list keys: %v", err)
 	}
 
-	if len(ks.Users) == 0 {
+	if len(keys) == 0 {
 		fmt.Println("No keys.")
 		return
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "USER\tKEY PREFIX\tCREATED")
-	for user, entry := range ks.Users {
-		prefix := entry.Key
-		if len(prefix) > 11 {
-			prefix = prefix[:11] + "..."
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\n", user, prefix, entry.Created)
+	for _, k := range keys {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", k.Username, k.KeyPrefix, k.CreatedAt)
 	}
 	w.Flush()
 }
 
+func cmdMigrate(args []string) {
+	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
+	from := fs.String("from", "keys.json", "path to JSON keys file")
+	dbPath := fs.String("db", "keys.db", "path to SQLite database")
+	fs.Parse(args)
+
+	ks, err := loadKeysJSON(*from)
+	if err != nil {
+		log.Fatalf("cannot read %s: %v", *from, err)
+	}
+
+	store, err := NewSQLiteStore(*dbPath)
+	if err != nil {
+		log.Fatalf("cannot open database: %v", err)
+	}
+	defer store.Close()
+
+	count := 0
+	for username, entry := range ks.Users {
+		if err := store.insertRaw(username, entry.Key, entry.Created); err != nil {
+			log.Printf("skipping %s: %v", username, err)
+			continue
+		}
+		count++
+	}
+
+	fmt.Printf("Migrated %d key(s) from %s to %s\n", count, *from, *dbPath)
+}
+
+// --- Admin API handlers ---
+
+func handleAdminAddKey(store KeyStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Username string `json:"username"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":"username is required"}`)
+			return
+		}
+
+		key, err := store.Add(req.Username)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{
+			"username": req.Username,
+			"key":      key,
+		})
+	}
+}
+
+func handleAdminRevokeKey(store KeyStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		username := r.PathValue("username")
+		if username == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":"username is required"}`)
+			return
+		}
+
+		if err := store.Revoke(username); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"message":"revoked key for %s"}`, username)
+	}
+}
+
+func handleAdminListKeys(store KeyStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		keys, err := store.List()
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"error":"failed to list keys"}`)
+			return
+		}
+		if keys == nil {
+			keys = []KeyInfo{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"keys": keys})
+	}
+}
+
 // --- HTTP middleware ---
 
-func authMiddleware(lookup map[string]string, next http.Handler) http.Handler {
+func adminAuthMiddleware(token string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			auth := r.Header.Get("Authorization")
+			if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != token {
+				w.Header().Set("Content-Type", "application/json")
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func authMiddleware(store KeyStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -284,7 +517,7 @@ func authMiddleware(lookup map[string]string, next http.Handler) http.Handler {
 			return
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
-		user, ok := lookup[token]
+		user, ok := store.Lookup(token)
 		if !ok {
 			http.Error(w, `{"error":"invalid proxy key"}`, http.StatusUnauthorized)
 			return
@@ -303,7 +536,8 @@ commands:
   serve    start the proxy server
   add      add a user and generate a proxy key
   revoke   revoke a user's proxy key
-  list     list all proxy keys`)
+  list     list all proxy keys
+  migrate  migrate keys from JSON file to SQLite`)
 	os.Exit(1)
 }
 
@@ -321,6 +555,8 @@ func main() {
 		cmdRevoke(os.Args[2:])
 	case "list":
 		cmdList(os.Args[2:])
+	case "migrate":
+		cmdMigrate(os.Args[2:])
 	default:
 		usage()
 	}
